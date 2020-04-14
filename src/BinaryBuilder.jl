@@ -87,8 +87,8 @@ function __init__()
     elseif get(ENV, "BINARYBUILDER_USE_SQUASHFS", "") == "true"
         use_squashfs = true
     else
-        # If it hasn't been specified, but we're on Travis, default to "on"
-        if get(ENV, "TRAVIS", "") == "true"
+        # If it hasn't been specified, but we're on Travis or GH Actions, default to "on"
+        if get(ENV, "TRAVIS", "") == "true" || get(ENV, "GITHUB_ACTIONS", "") == "true"
             use_squashfs = true
         end
 

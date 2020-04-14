@@ -579,8 +579,9 @@ function autobuild(dir::AbstractString,
         return Dict()
     end
 
-    # If we're on CI and we're not verbose, schedule a task to output a "." every few seconds
-    if (haskey(ENV, "TRAVIS") || haskey(ENV, "CI")) && !verbose
+    # If we're on CI and we're not verbose, schedule a task to output a "." every few seconds.
+    # Exclude GitHub Actions, it wouldn't time out
+    if (haskey(ENV, "TRAVIS") || (haskey(ENV, "CI") && !haskey(ENV, "GITHUB_ACTIONS"))) && !verbose
         run_travis_busytask = true
         travis_busytask = @async begin
             # Don't let Travis think we're asleep...
@@ -795,7 +796,7 @@ function autobuild(dir::AbstractString,
         end
     end
 
-    if (haskey(ENV, "TRAVIS") || haskey(ENV, "CI")) && !verbose
+    if (haskey(ENV, "TRAVIS") || (haskey(ENV, "CI") && !haskey(ENV, "GITHUB_ACTIONS"))) && !verbose
         run_travis_busytask = false
         wait(travis_busytask)
         println()
