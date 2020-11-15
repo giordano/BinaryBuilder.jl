@@ -11,10 +11,12 @@ function check_os_abi(oh::ObjectHandle, p::AbstractPlatform, rest...; verbose::B
                 $(basename(path(oh))) has an ELF header OS/ABI value that is not set to FreeBSD
                 ($(ELF.ELFOSABI_FREEBSD)), this may be an issue at link time"
                 """, '\n' => ' ')
-                @warn(strip(msg))
+                with_logger(logger) do
+                    @warn(strip(msg))
+                end
             end
-            return false
+            return AuditCheck(false, logger)
         end
     end
-    return true
+    return AuditCheck(true, logger)
 end

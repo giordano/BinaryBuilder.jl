@@ -2,6 +2,7 @@ module Auditor
 
 using BinaryBuilderBase
 using Base.BinaryPlatforms
+using Base.Threads
 using Pkg
 using ObjectFile
 
@@ -16,6 +17,26 @@ include("auditor/compiler_abi.jl")
 include("auditor/soname_matching.jl")
 include("auditor/filesystems.jl")
 include("auditor/extra_checks.jl")
+
+struct AuditCheck
+    is_ok::Bool
+    log::String
+end
+AuditCheck(is_ok::Bool, logger::ConsoleLogger) =
+    AuditCheck(is_ok, String(take!(logger.stream.io)))
+is_ok(c::AuditCheck) = c.is_ok
+
+function collect_checks!(checks)
+    all_ok = all(is_ok, Iterators.flatten(checks))
+    # Reset all vectors of checks
+    for idx in eachindex(checks)
+        for c in checks[idx]
+            print(io, c.log)
+        end
+        checks[idx] = AuditCheck[]
+    end
+    return all_ok
+end
 
 # AUDITOR TODO LIST:
 #
@@ -67,12 +88,20 @@ function audit(prefix::Prefix, src_name::AbstractString = "";
     # Inspect binary files, looking for improper linkage
     predicate = f -> (filemode(f) & 0o111) != 0 || valid_library_path(f, platform)
     bin_files = collect_files(prefix, predicate; exclude_externalities=false)
-    for f in collapse_symlinks(bin_files)
+
+    checks = Vector{Vector{AuditCheck}}(undef, nthreds())
+    # Reset all vectors of checks
+    for idx in eachindex(checks)
+        checks[idx] = AuditCheck[]
+    end
+
+    @threads for f in collapse_symlinks(bin_files)
         # If `f` is outside of our prefix, ignore it.  This happens with files from our dependencies
         if !startswith(f, prefix.path)
             continue
         end
 
+        logger = ConsoleLogger(IOContext(IOBuffer(), :color => get(io, :color, false)))
         # Peel this binary file open like a delicious tangerine
         try
             readmeta(f) do oh
@@ -82,25 +111,25 @@ function audit(prefix::Prefix, src_name::AbstractString = "";
                     end
                 else
                     # Check that the ISA isn't too high
-                    all_ok &= check_isa(oh, platform, prefix; verbose=verbose, silent=silent)
+                    push!(checks[threadid()], check_isa(oh, platform, prefix, logger; verbose=verbose, silent=silent))
                     # Check that the OS ABI is set correctly (often indicates the wrong linker was used)
-                    all_ok &= check_os_abi(oh, platform, verbose = verbose)
+                    push!(checks[threadid()], check_os_abi(oh, platform, logger; verbose = verbose))
 
                     # If this is a dynamic object, do the dynamic checks
                     if isdynamic(oh)
                         # Check that the libgfortran version matches
-                        all_ok &= check_libgfortran_version(oh, platform; verbose=verbose, has_csl = has_csl)
+                        push!(checks[threadid()], check_libgfortran_version(oh, platform, logger; verbose=verbose, has_csl = has_csl))
                         # Check whether the library depends on any of the most common
                         # libraries provided by `CompilerSupportLibraries_jll`.
-                        all_ok &= check_csl_libs(oh, platform; verbose=verbose, has_csl=has_csl)
+                        push!(checks[threadid()], check_csl_libs(oh, platform, logger; verbose=verbose, has_csl=has_csl))
                         # Check that the libstdcxx string ABI matches
-                        all_ok &= check_cxxstring_abi(oh, platform; verbose=verbose)
+                        push!(checks[threadid()], check_cxxstring_abi(oh, platform, logger; verbose=verbose))
                         # Check that this binary file's dynamic linkage works properly.  Note to always
                         # DO THIS ONE LAST as it can actually mutate the file, which causes the previous
                         # checks to freak out a little bit.
-                        all_ok &= check_dynamic_linkage(oh, prefix, bin_files;
-                                                        platform=platform, silent=silent,
-                                                        verbose=verbose, autofix=autofix)
+                        push!(checks[threadid()], check_dynamic_linkage(oh, prefix, bin_files, logger;
+                                                                        platform=platform, silent=silent,
+                                                                        verbose=verbose, autofix=autofix))
                     end
                 end
             end
@@ -115,11 +144,14 @@ function audit(prefix::Prefix, src_name::AbstractString = "";
             end
         end
     end
-
+    all_ok &= collect_checks!(checks)
     # Find all dynamic libraries
     shlib_files = filter(f -> startswith(f, prefix.path) && valid_library_path(f, platform), collapse_symlinks(bin_files))
 
-    for f in shlib_files
+    @threads for f in shlib_files
+
+        logger = ConsoleLogger(IOContext(IOBuffer(), :color => get(io, :color, false)))
+
         # Inspect all shared library files for our platform (but only if we're
         # running native, don't try to load library files from other platforms)
         if platforms_match(platform, HostPlatform())
@@ -153,21 +185,25 @@ function audit(prefix::Prefix, src_name::AbstractString = "";
                 # TODO: Use the relevant ObjFileBase packages to inspect why
                 # this file is being nasty to us.
                 if !silent
-                    @warn("$(relpath(f, prefix.path)) cannot be dlopen()'ed")
+                    with_logger(logger) do
+                        @warn("$(relpath(f, prefix.path)) cannot be dlopen()'ed")
+                    end
                 end
-                all_ok = false
+                push!(checks[threadid()], AuditCheck(false, logger))
             end
         end
 
         # Ensure that all libraries have at least some kind of SONAME, if we're
         # on that kind of platform
         if !Sys.iswindows(platform)
-            all_ok &= ensure_soname(prefix, f, platform; verbose=verbose, autofix=autofix)
+            push!(checks[threadid()], ensure_soname(prefix, f, platform, logger; verbose=verbose, autofix=autofix))
         end
 
         # Ensure that this library is available at its own SONAME
-        all_ok &= symlink_soname_lib(f; verbose=verbose, autofix=autofix)
+        push!(checks[threadid()], symlink_soname_lib(f, logger; verbose=verbose, autofix=autofix))
+
     end
+    all_ok &= collect_checks!(checks)
 
     if Sys.iswindows(platform)
         # We also cannot allow any symlinks in Windows because it requires
@@ -259,7 +295,7 @@ function compatible_marchs(platform::AbstractPlatform)
     return march_list[begin:idx]
 end
 
-function check_isa(oh, platform, prefix;
+function check_isa(oh, platform, prefix, logger;
                    verbose::Bool = false,
                    silent::Bool = false)
     detected_march = analyze_instruction_set(oh, platform; verbose=verbose)
@@ -272,9 +308,11 @@ function check_isa(oh, platform, prefix;
             Minimum instruction set detected for $(relpath(path(oh), prefix.path)) is
             $(detected_march), not $(last(platform_marchs)) as desired.
             """, '\n' => ' ')
-            @warn(strip(msg))
+            with_logger(logger) do
+                @warn(strip(msg))
+            end
         end
-        return false
+        return AuditCheck(false, logger)
     elseif detected_march != last(platform_marchs)
         # The object file is compatible with the desired
         # microarchitecture, but using a lower instruction set: inform
@@ -286,10 +324,12 @@ function check_isa(oh, platform, prefix;
             $(detected_march), not $(last(platform_marchs)) as desired.
             You may be missing some optimization flags during compilation.
             """, '\n' => ' ')
-            @warn(strip(msg))
+            with_logger(logger) do
+                @warn(strip(msg))
+            end
         end
     end
-    return true
+    return AuditCheck(true, logger)
 end
 
 function check_dynamic_linkage(oh, prefix, bin_files;

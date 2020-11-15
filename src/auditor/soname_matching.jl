@@ -38,28 +38,32 @@ function get_soname(oh::MachOHandle)
 end
 
 
-function ensure_soname(prefix::Prefix, path::AbstractString, platform::AbstractPlatform;
+function ensure_soname(prefix::Prefix, path::AbstractString, platform::AbstractPlatform, logger;
                        verbose::Bool = false, autofix::Bool = false)
     # Skip any kind of Windows platforms
     if Sys.iswindows(platform)
-        return true
+        return AuditCheck(true, logger)
     end
 
     # Skip if this file already contains an SONAME
     rel_path = relpath(realpath(path), realpath(prefix.path))
-    soname = get_soname(path)
+    with_logger(logger) do
+        soname = get_soname(path)
+    end
     if soname != nothing
         if verbose
-            @info("$(rel_path) already has SONAME \"$(soname)\"")
+            with_logger(logger) do
+                @info("$(rel_path) already has SONAME \"$(soname)\"")
+            end
         end
-        return true
+        return AuditCheck(true, logger)
     else
         soname = basename(path)
     end
 
     # If we're not allowed to fix it, fail out
     if !autofix
-        return false
+        return AuditCheck(false, logger)
     end
 
     # Otherwise, set the SONAME
@@ -80,22 +84,30 @@ function ensure_soname(prefix::Prefix, path::AbstractString, platform::AbstractP
     end
 
     if !retval
-        @warn("Unable to set SONAME on $(rel_path)")
-        return false
+        with_logger(logger) do
+            @warn("Unable to set SONAME on $(rel_path)")
+        end
+        return AuditCheck(false, logger)
     end
 
     # Read the SONAME back in and ensure it's set properly
-    new_soname = get_soname(path)
+    with_logger(logger) do
+        new_soname = get_soname(path)
+    end
     if new_soname != soname
-        @warn("Set SONAME on $(rel_path) to $(soname), but read back $(string(new_soname))!")
-        return false
+        with_logger(logger) do
+            @warn("Set SONAME on $(rel_path) to $(soname), but read back $(string(new_soname))!")
+        end
+        return AuditCheck(false, logger)
     end
 
     if verbose
-        @info("Set SONAME of $(rel_path) to \"$(soname)\"")
+        with_logger(logger) do
+            @info("Set SONAME of $(rel_path) to \"$(soname)\"")
+        end
     end
 
-    return true
+    return AuditCheck(true, logger)
 end
 
 """
@@ -105,12 +117,15 @@ We require that all shared libraries are accessible on disk through their
 SONAME (if it exists).  While this is almost always true in practice, it
 doesn't hurt to make doubly sure.
 """
-function symlink_soname_lib(path::AbstractString; verbose::Bool = false,
-                                                  autofix::Bool = false)
+function symlink_soname_lib(path::AbstractString, logger;
+                            verbose::Bool = false,
+                            autofix::Bool = false)
     # If this library doesn't have an SONAME, then just quit out immediately
-    soname = get_soname(path)
+    with_logger(logger) do
+        soname = get_soname(path)
+    end
     if soname === nothing
-        return true
+        return AuditCheck(true, logger)
     end
 
     # Absolute path to where the SONAME-named file should be
@@ -119,15 +134,19 @@ function symlink_soname_lib(path::AbstractString; verbose::Bool = false,
         if autofix
             target = basename(path)
             if verbose
-                @info("Library $(soname) does not exist, creating link to $(target)...")
+                with_logger(logger) do
+                    @info("Library $(soname) does not exist, creating link to $(target)...")
+                end
             end
             symlink(target, soname_path)
         else
             if verbose
-                @info("Library $(soname) does not exist, failing out...")
+                with_logger(logger) do
+                    @info("Library $(soname) does not exist, failing out...")
+                end
             end
-            return false
+            return AuditCheck(false, logger)
         end
     end
-    return true
+    return AuditCheck(true, logger)
 end
