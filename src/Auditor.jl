@@ -159,7 +159,7 @@ function audit(prefix::Prefix, src_name::AbstractString = "";
                 end
             """
             try
-                p = run(ignorestatus(addenv(`$(Base.julia_cmd()) -e $dlopen_cmd`, "LD_DEBUG" => "libs")))
+                p = run(ignorestatus(addenv(`$(Base.julia_cmd()) -e $dlopen_cmd`, "LD_DEBUG" => "all")))
                 if p.exitcode != 0
                     throw("Invalid exit code!")
                 end
